@@ -1,0 +1,69 @@
+# Push a tag like v0.1.0: tests run, binaries are built, and a GitHub Release gets them plus psst.py and the installers.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python psst.py --selftest
+
+  build:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-22.04, name: psst-linux-x64 }
+          - { os: ubuntu-22.04-arm, name: psst-linux-arm64 }
+          - { os: macos-14, name: psst-darwin-arm64 }
+          - { os: windows-latest, name: psst-windows-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pyinstaller==6.11.1
+      - run: pyinstaller --onefile --name ${{ matrix.name }} psst.py
+      - run: ./dist/${{ matrix.name }} --version
+        shell: bash
+      - run: ./dist/${{ matrix.name }} --init pwsh | Out-String | Invoke-Expression; Get-Command psst
+        if: runner.os == 'Windows'
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with: { name: "${{ matrix.name }}", path: dist/* }
+
+  build-musl:
+    needs: test
+    runs-on: ubuntu-latest
+    container: python:3.12-alpine
+    steps:
+      - uses: actions/checkout@v4
+      - run: apk add --no-cache binutils && pip install pyinstaller==6.11.1
+      - run: pyinstaller --onefile --name psst-linux-musl-x64 psst.py && ./dist/psst-linux-musl-x64 --version
+      - uses: actions/upload-artifact@v4
+        with: { name: psst-linux-musl-x64, path: dist/* }
+
+  release:
+    needs: [build, build-musl]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*
+            psst.py
+            install.sh
+            install.ps1
