@@ -13,7 +13,7 @@ import datetime, functools, hashlib, json, os, platform, re, shlex, shutil, sqli
 import urllib.error, urllib.request
 from pathlib import Path
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 API = "https://openrouter.ai/api/v1"
 WIN = os.name == "nt"
 SHELLS = {  # name: (run a script, check syntax of stdin, list builtins)
@@ -23,7 +23,12 @@ SHELLS = {  # name: (run a script, check syntax of stdin, list builtins)
     "pwsh": (["-NoProfile", "-NonInteractive", "-Command"], None, "Get-Command -CommandType Cmdlet,Function | ForEach-Object Name"),
 }
 SHELLS["powershell"] = SHELLS["pwsh"]
-PS_PARSE = "$e=$null; [void][Management.Automation.Language.Parser]::ParseInput($env:PSST_CHECK,[ref]$null,[ref]$e); if ($e) { $e[0].Message; exit 1 }"
+# PowerShell's own parser: the first syntax error, or one line per command with its words tab-separated ('$' for non-literals)
+PS_PARSE = ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; $e = $null; "
+            "$a = [Management.Automation.Language.Parser]::ParseInput($env:PSST_CHECK, [ref]$null, [ref]$e); if ($e) { $e[0].Message; exit 1 }; "
+            "$a.FindAll({ $args[0] -is [Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { ($_.CommandElements | ForEach-Object { "
+            "if ($_ -is [Management.Automation.Language.StringConstantExpressionAst]) { $_.Value -replace '\\s', ' ' } "
+            "elseif ($_ -is [Management.Automation.Language.CommandParameterAst]) { '-' + $_.ParameterName } else { '$' } }) -join \"`t\" }")
 BEGIN, END = "# >>> psst >>>", "# <<< psst <<<"
 MODELS = ["cohere/north-mini-code:free", "xingchen-agi/xing4.0-29b-a4b:free", "google/gemma-4-31b-it:free"]
 KEY_UTILS = "sed grep find awk date stat tar xargs ls cp mv rm du df sort head tail ps readlink base64 split touch cut tac timeout nproc".split()
@@ -502,9 +507,23 @@ def check_line(line, res, seen=()):
         i += 1
 
 
+def ps_parse(cmd, s):
+    """(syntax error or None, the commands PowerShell itself sees, as [name, args...])"""
+    try:
+        p = subprocess.run([s["shell_path"]] + SHELLS["pwsh"][0] + [PS_PARSE], capture_output=True, encoding="utf-8", errors="replace",
+                           timeout=10, stdin=subprocess.DEVNULL, env=dict(os.environ, PSST_CHECK=cmd))
+    except (OSError, subprocess.TimeoutExpired):
+        return None, []
+    if p.returncode:
+        return (p.stdout + p.stderr).strip() or "syntax error", []
+    return None, [l.split("\t") for l in p.stdout.splitlines() if l.strip()]
+
+
 def syntax(cmd, s):
     run_script, check, _ = SHELLS.get(s["shell"], SHELLS["bash"])
-    argv = [s["shell_path"]] + (check or run_script + [PS_PARSE])
+    if not check:
+        return ps_parse(cmd, s)[0]
+    argv = [s["shell_path"]] + check
     try:
         p = subprocess.run(argv, input=cmd, capture_output=True, text=True, timeout=10, env=dict(os.environ, PSST_CHECK=cmd))
     except (OSError, subprocess.TimeoutExpired):
@@ -514,10 +533,15 @@ def syntax(cmd, s):
 
 def validate(cmd, s, shell_check=True):
     res = {"s": s, "err": [], "warn": [], "missing": [], "words": set(), "defined": set(), "help": {}}
-    e = shell_check and syntax(cmd, s)
+    if s["shell"] in ("pwsh", "powershell"):  # only PowerShell's parser tells commands from hashtable keys and .Members
+        e, cmds = ps_parse(cmd, s)
+        for toks in cmds:
+            check_cmd(toks, res)
+    else:
+        e = shell_check and syntax(cmd, s)
+        check_line(cmd, res)
     if e:
         res["err"].append(f"{s['shell']} -n: {e}")
-    check_line(cmd, res)
     res["warn" if INSTALL.search(cmd) else "err"] += res["missing"]
     return res
 
@@ -759,7 +783,7 @@ end
   $enc = [Console]::OutputEncoding; [Console]::OutputEncoding = [Text.Encoding]::UTF8; $env:PYTHONIOENCODING = 'utf-8'
   $out = (PSST_EXE @args) -join "`n"
   [Console]::OutputEncoding = $enc
-  Remove-Item Env:PYTHONIOENCODING, Env:PSST_SHELL, Env:PSST_SHELL_PATH, Env:PSST_SHELL_VERSION, Env:PSST_ALIASES, Env:PSST_FUNCS, Env:PSST_LAST, Env:PSST_STATUS
+  Remove-Item Env:PYTHONIOENCODING, Env:PSST_SHELL, Env:PSST_SHELL_PATH, Env:PSST_SHELL_VERSION, Env:PSST_ALIASES, Env:PSST_FUNCS, Env:PSST_LAST, Env:PSST_STATUS -ErrorAction SilentlyContinue  # PSST_LAST is unset in a fresh session
   if ($out) { try { [Microsoft.PowerShell.PSConsoleReadLine]::AddToHistory($out); Write-Host 'psst: press Up to get the command' } catch {} }
 }
 """}
@@ -966,6 +990,16 @@ def selftest():
         ok("syntax", validate(c + " )", s)["err"], repr(c))
     ok("corpus size", len(good) >= 50, str(len(good)))
     ok("install makes missing a warning", not validate("brew install ripgrep && rg -n TODO", s)["err"])
+    if shutil.which("pwsh"):  # PowerShell: hashtable keys and .Members are not commands (issue #1)
+        ps = session(dict(os.environ, PSST_SHELL="pwsh", PSST_SHELL_PATH=shutil.which("pwsh")))
+        for c in ["Get-ChildItem -File | ForEach-Object { [PSCustomObject]@{ Name = $_.Name; Lines = (Get-Content $_.FullName | Measure-Object -Line).Lines } }"
+                  " | Sort-Object -Property Lines -Descending | Select-Object -First 5 Name, Lines",
+                  "(Get-Item a.txt).Length", "$d = Get-Date; $d.AddDays(-7).ToString('yyyy-MM-dd')", "@{ a = 1 }.GetEnumerator() | Sort-Object Value",
+                  "foreach ($f in Get-ChildItem *.txt) { (Get-Content $f).Count }"]:
+            r = validate(c, ps)
+            ok("pwsh: pass", not r["err"] and not r["warn"], f"{c!r}: {r['err'] + r['warn']}")
+        ok("pwsh: missing", validate("Get-ChildItem | ForEach-Object { Get-Qzxnope -X }", ps)["err"])
+        ok("pwsh: syntax", validate("Get-ChildItem | ForEach-Object {", ps)["err"])
     for _, _, rejected in forms:  # a variant-specific form for a missing tool or a BSD tool must be flagged
         for c in rejected:
             kind, info = resolve(c.split()[0], s)
