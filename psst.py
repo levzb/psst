@@ -214,7 +214,10 @@ def session(env=None, cwd=None):
             for name in {n, os.path.splitext(n)[0]} if WIN else (n,):
                 s["cmds"].setdefault(name, os.path.join(d, n))
     run_script, _, script = SHELLS.get(sh, SHELLS["bash"])
-    s["builtins"] = set(cached("builtins\0" + sh, stamp(s["shell_path"]), lambda: run([s["shell_path"]] + run_script + [script], timeout=10).split()))
+    # PowerShell modules such as Azure and Graph can export thousands of commands.
+    limit = 10_000_000 if sh in ("pwsh", "powershell") else 300_000
+    s["builtins"] = set(cached("builtins\0" + sh, [stamp(s["shell_path"]), script, limit],
+                               lambda: run([s["shell_path"]] + run_script + [script], timeout=10, limit=limit).split()))
     return s
 
 
